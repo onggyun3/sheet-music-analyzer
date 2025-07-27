@@ -1,229 +1,196 @@
-# app.py - 악보 인식 서버
+# app.py - 메모리 최적화된 악보 인식 서버
 from flask import Flask, request, jsonify
-import cv2
-import numpy as np
 import base64
-from PIL import Image, ImageDraw, ImageFont
 import io
 import json
+import gc  # 가비지 컬렉션
 
 app = Flask(__name__)
 
-# 기본 함수들 (앞서 제공해주신 코드 기반)
-def threshold(image):
-    """이미지 이진화"""
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    ret, image = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-    return image
+# 메모리 사용량을 줄이기 위해 필요할 때만 import
+def get_cv2():
+    try:
+        import cv2
+        return cv2
+    except ImportError:
+        return None
 
-def weighted(value, standard=10):
-    """가중치 계산"""
-    return int(value * (standard / 10))
+def get_numpy():
+    try:
+        import numpy as np
+        return np
+    except ImportError:
+        return None
 
-def closing(image, standard=10):
-    """닫힘 연산"""
-    kernel = np.ones((weighted(5, standard), weighted(5, standard)), np.uint8)
-    image = cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel)
-    return image
+def get_pil():
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        return Image, ImageDraw, ImageFont
+    except ImportError:
+        return None, None, None
 
-def get_center(y, h):
-    """객체 중심점 계산"""
-    return (y + y + h) / 2
-
-def remove_noise(image):
-    """보표 영역만 추출"""
-    image = threshold(image)
-    mask = np.zeros(image.shape, np.uint8)
-    cnt, labels, stats, centroids = cv2.connectedComponentsWithStats(image)
+# 간단한 이미지 처리 함수들
+def simple_threshold(image_array, np):
+    """간단한 이진화"""
+    if len(image_array.shape) == 3:
+        # 그레이스케일 변환
+        gray = np.dot(image_array[...,:3], [0.2989, 0.5870, 0.1140])
+    else:
+        gray = image_array
     
-    for i in range(1, cnt):
-        x, y, w, h, area = stats[i]
-        if w > image.shape[1] * 0.5:  # 이미지 넓이의 50% 이상
-            cv2.rectangle(mask, (x, y, w, h), (255, 0, 0), -1)
-    
-    masked_image = cv2.bitwise_and(image, mask)
-    return masked_image
+    # 간단한 임계값 처리
+    threshold = np.mean(gray)
+    binary = (gray < threshold).astype(np.uint8) * 255
+    return binary
 
-def remove_staves(image):
-    """오선 제거"""
-    height, width = image.shape
-    staves = []
+def find_horizontal_lines(binary_image, np):
+    """수평선(오선) 찾기"""
+    height, width = binary_image.shape
+    lines = []
     
-    # 오선 검출
     for row in range(height):
-        pixels = 0
-        for col in range(width):
-            pixels += (image[row][col] == 255)
-        
-        if pixels >= width * 0.5:
-            if len(staves) == 0 or abs(staves[-1][0] + staves[-1][1] - row) > 1:
-                staves.append([row, 1])
-            else:
-                staves[-1][1] += 1
+        white_pixels = np.sum(binary_image[row] == 255)
+        if white_pixels > width * 0.5:  # 50% 이상이 흰색이면 선으로 간주
+            lines.append(row)
     
-    # 오선 제거
-    for staff in range(len(staves)):
-        top_pixel = staves[staff][0]
-        bot_pixel = staves[staff][0] + staves[staff][1]
-        
-        for col in range(width):
-            if (top_pixel > 0 and bot_pixel < height-1 and 
-                image[top_pixel - 1][col] == 0 and 
-                image[bot_pixel + 1][col] == 0):
-                for row in range(top_pixel, bot_pixel + 1):
-                    image[row][col] = 0
-    
-    return image, [x[0] for x in staves]
+    return lines
 
-def normalization(image, staves, standard=10):
-    """이미지 정규화"""
-    if len(staves) < 5:
-        return image, staves
-    
-    avg_distance = 0
-    lines = int(len(staves) / 5)
-    
-    for line in range(lines):
-        for staff in range(4):
-            if line * 5 + staff + 1 < len(staves):
-                staff_above = staves[line * 5 + staff]
-                staff_below = staves[line * 5 + staff + 1]
-                avg_distance += abs(staff_above - staff_below)
-    
-    if avg_distance == 0:
-        return image, staves
-    
-    avg_distance /= len(staves) - lines
+def remove_lines(image, lines, np):
+    """선 제거"""
+    result = image.copy()
+    for line in lines:
+        if 0 < line < image.shape[0] - 1:
+            # 위아래에 픽셀이 없는 곳만 제거
+            for col in range(image.shape[1]):
+                if (image[line-1, col] == 0 and image[line+1, col] == 0):
+                    result[line, col] = 0
+    return result
+
+def find_objects(image, np):
+    """간단한 객체 검출"""
+    # 연결된 컴포넌트 찾기 (간단한 버전)
     height, width = image.shape
-    weight = standard / avg_distance
-    
-    new_width = int(width * weight)
-    new_height = int(height * weight)
-    
-    image = cv2.resize(image, (new_width, new_height))
-    ret, image = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    staves = [x * weight for x in staves]
-    
-    return image, staves
-
-def object_detection(image, staves, standard=10):
-    """객체 검출"""
-    if len(staves) < 5:
-        return image, []
-    
-    lines = int(len(staves) / 5)
+    visited = np.zeros((height, width), dtype=bool)
     objects = []
-    closing_image = closing(image, standard)
-    cnt, labels, stats, centroids = cv2.connectedComponentsWithStats(closing_image)
     
-    for i in range(1, cnt):
-        (x, y, w, h, area) = stats[i]
-        if w >= weighted(5, standard) and h >= weighted(5, standard):
-            center = get_center(y, h)
-            for line in range(lines):
-                area_top = staves[line * 5] - weighted(20, standard)
-                area_bot = staves[(line + 1) * 5 - 1] + weighted(20, standard)
-                if area_top <= center <= area_bot:
-                    objects.append([line, (x, y, w, h, area)])
+    def flood_fill(start_row, start_col):
+        if (start_row < 0 or start_row >= height or 
+            start_col < 0 or start_col >= width or
+            visited[start_row, start_col] or 
+            image[start_row, start_col] == 0):
+            return []
+        
+        stack = [(start_row, start_col)]
+        component = []
+        
+        while stack:
+            row, col = stack.pop()
+            if (row < 0 or row >= height or col < 0 or col >= width or
+                visited[row, col] or image[row, col] == 0):
+                continue
+                
+            visited[row, col] = True
+            component.append((row, col))
+            
+            # 8방향 연결
+            for dr in [-1, 0, 1]:
+                for dc in [-1, 0, 1]:
+                    if dr != 0 or dc != 0:
+                        stack.append((row + dr, col + dc))
+        
+        return component
     
-    objects.sort()
-    return image, objects
+    for row in range(height):
+        for col in range(width):
+            if image[row, col] == 255 and not visited[row, col]:
+                component = flood_fill(row, col)
+                if len(component) > 10:  # 최소 크기 필터
+                    min_row = min(p[0] for p in component)
+                    max_row = max(p[0] for p in component)
+                    min_col = min(p[1] for p in component)
+                    max_col = max(p[1] for p in component)
+                    
+                    objects.append({
+                        'x': min_col,
+                        'y': min_row,
+                        'width': max_col - min_col,
+                        'height': max_row - min_row,
+                        'area': len(component)
+                    })
+    
+    return objects
 
-def analyze_note_positions(objects, staves, standard=10):
+def analyze_note_positions(objects, staff_lines):
     """음표 위치 분석하여 계이름 결정"""
     notes = []
     
-    if len(staves) < 5:
+    if len(staff_lines) < 5:
         return notes
     
-    # 기본적인 계이름 매핑 (트레블 클레프 기준)
-    # 오선 간격을 기준으로 음높이 계산
+    # 기본적인 계이름 매핑
+    note_names = ['도', '레', '미', '파', '솔', '라', '시']
+    
     for obj in objects:
-        line_num, (x, y, w, h, area) = obj
+        center_y = obj['y'] + obj['height'] // 2
         
-        if line_num * 5 + 4 >= len(staves):
-            continue
+        # 가장 가까운 오선 찾기
+        if len(staff_lines) >= 5:
+            # 첫 번째 보표의 오선들 사용
+            staff_spacing = (staff_lines[4] - staff_lines[0]) / 4 if len(staff_lines) >= 5 else 10
             
-        # 해당 보표의 오선들
-        staff_lines = staves[line_num * 5:line_num * 5 + 5]
-        center_y = y + h // 2
-        
-        # 오선 간격 계산
-        if len(staff_lines) >= 2:
-            line_spacing = (staff_lines[-1] - staff_lines[0]) / 4
+            # 두 번째 오선(솔)을 기준으로 계산
+            reference_line = staff_lines[1] if len(staff_lines) >= 2 else staff_lines[0]
+            distance_from_reference = (reference_line - center_y) / staff_spacing
             
-            # 기준선(두 번째 오선, 트레블 클레프의 솔)에서의 거리
-            reference_line = staff_lines[1]  # 두 번째 오선 (솔)
-            distance_from_sol = (reference_line - center_y) / line_spacing
+            # 계이름 결정
+            note_index = int(round(distance_from_reference)) + 4  # 솔을 기준(4)으로
             
-            # 거리에 따른 계이름 결정
-            note_names = ['도', '레', '미', '파', '솔', '라', '시']
-            
-            # 솔(두 번째 오선)을 기준(인덱스 4)으로 계산
-            note_index = int(round(distance_from_sol)) + 4
-            
-            # 범위 내에서 계이름 결정
             if 0 <= note_index < len(note_names):
                 note_name = note_names[note_index]
             else:
-                # 범위를 벗어나면 옥타브 계산
-                octave_offset = note_index // len(note_names)
-                adjusted_index = note_index % len(note_names)
-                note_name = note_names[adjusted_index]
-                if octave_offset > 0:
-                    note_name += f"(+{octave_offset})"
-                elif octave_offset < 0:
-                    note_name += f"({octave_offset})"
+                # 범위를 벗어나면 옥타브 고려
+                note_name = note_names[note_index % len(note_names)]
             
             notes.append({
-                'x': x,
-                'y': y,
-                'width': w,
-                'height': h,
+                'x': obj['x'],
+                'y': obj['y'],
+                'width': obj['width'],
+                'height': obj['height'],
                 'note_name': note_name,
-                'center_x': x + w // 2,
+                'center_x': obj['x'] + obj['width'] // 2,
                 'center_y': center_y
             })
     
     return notes
 
-def overlay_note_names(original_image, notes, settings):
-    """계이름을 이미지에 오버레이"""
-    # OpenCV 이미지를 PIL로 변환
-    pil_image = Image.fromarray(cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(pil_image)
+@app.route('/health', methods=['GET'])
+def health_check():
+    """서버 상태 확인"""
+    cv2 = get_cv2()
+    np = get_numpy()
     
-    # 폰트 설정
-    font_size = settings.get('fontSize', 24)
-    font_color = settings.get('fontColor', '#000000')
+    status = {
+        'status': 'healthy',
+        'opencv': cv2 is not None,
+        'numpy': np is not None,
+        'message': '악보 인식 서버가 정상 작동 중입니다.'
+    }
     
-    try:
-        # 시스템 기본 폰트 사용
-        font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", font_size)
-    except:
-        font = ImageFont.load_default()
-    
-    # 각 음표 아래에 계이름 표시
-    for note in notes:
-        text = note['note_name']
-        x = note['center_x']
-        y = note['y'] + note['height'] + 5  # 음표 아래쪽에 표시
-        
-        # 텍스트 크기 계산
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_x = x - text_width // 2  # 중앙 정렬
-        
-        # 텍스트 그리기
-        draw.text((text_x, y), text, fill=font_color, font=font)
-    
-    # PIL을 다시 OpenCV로 변환
-    result_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-    return result_image
+    return jsonify(status)
 
 @app.route('/analyze-sheet-music', methods=['POST'])
 def analyze_sheet_music():
     """악보 분석 메인 엔드포인트"""
+    cv2 = get_cv2()
+    np = get_numpy()
+    Image, ImageDraw, ImageFont = get_pil()
+    
+    if not cv2 or not np:
+        return jsonify({
+            'success': False,
+            'error': 'OpenCV 또는 NumPy가 설치되지 않았습니다.'
+        })
+    
     try:
         data = request.json
         image_base64 = data['image']
@@ -241,59 +208,113 @@ def analyze_sheet_music():
         
         print("이미지 로드 완료")
         
-        # 악보 인식 처리 과정
-        # 1. 전처리
-        processed_image = remove_noise(original_image.copy())
-        print("노이즈 제거 완료")
+        # 메모리 절약을 위해 이미지 크기 조정
+        height, width = original_image.shape[:2]
+        if width > 800:
+            scale = 800 / width
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            original_image = cv2.resize(original_image, (new_width, new_height))
+            print(f"이미지 크기 조정: {width}x{height} -> {new_width}x{new_height}")
         
-        # 2. 오선 제거
-        no_staves_image, staves = remove_staves(processed_image.copy())
-        print(f"오선 제거 완료, 검출된 오선: {len(staves)}개")
+        # 간단한 전처리
+        gray = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
+        binary = simple_threshold(gray, np)
+        print("이진화 완료")
         
-        # 3. 정규화
-        normalized_image, normalized_staves = normalization(no_staves_image.copy(), staves.copy())
-        print("정규화 완료")
+        # 수평선(오선) 검출
+        staff_lines = find_horizontal_lines(binary, np)
+        print(f"오선 검출 완료: {len(staff_lines)}개")
         
-        # 4. 객체 검출
-        final_image, objects = object_detection(normalized_image.copy(), normalized_staves.copy())
-        print(f"객체 검출 완료, 검출된 객체: {len(objects)}개")
+        # 오선 제거
+        no_lines_image = remove_lines(binary, staff_lines, np)
+        print("오선 제거 완료")
         
-        # 5. 음표 위치 분석
-        notes = analyze_note_positions(objects, normalized_staves)
-        print(f"음표 분석 완료, 분석된 음표: {len(notes)}개")
+        # 객체 검출
+        objects = find_objects(no_lines_image, np)
+        print(f"객체 검출 완료: {len(objects)}개")
         
-        # 6. 계이름 오버레이
-        result_image = overlay_note_names(original_image, notes, note_settings)
+        # 음표 분석
+        notes = analyze_note_positions(objects, staff_lines)
+        print(f"음표 분석 완료: {len(notes)}개")
+        
+        # 계이름 오버레이
+        if Image and ImageDraw:
+            result_image = overlay_note_names(original_image, notes, note_settings, Image, ImageDraw, ImageFont)
+        else:
+            result_image = original_image
+        
         print("계이름 오버레이 완료")
         
         # 결과 이미지를 Base64로 변환
         _, buffer = cv2.imencode('.png', result_image)
         result_base64 = base64.b64encode(buffer).decode('utf-8')
         
+        # 메모리 정리
+        del original_image, gray, binary, no_lines_image
+        gc.collect()
+        
         return jsonify({
             'success': True,
             'result_image': result_base64,
             'notes_detected': len(notes),
             'notes': notes,
-            'staves_detected': len(staves),
+            'staves_detected': len(staff_lines),
             'objects_detected': len(objects)
         })
         
     except Exception as e:
         print(f"오류 발생: {str(e)}")
+        gc.collect()  # 오류 시에도 메모리 정리
         return jsonify({
             'success': False,
             'error': str(e)
         })
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """서버 상태 확인"""
-    return jsonify({'status': 'healthy', 'message': '악보 인식 서버가 정상 작동 중입니다.'})
+def overlay_note_names(original_image, notes, settings, Image, ImageDraw, ImageFont):
+    """계이름을 이미지에 오버레이"""
+    try:
+        # OpenCV 이미지를 PIL로 변환
+        pil_image = Image.fromarray(cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_image)
+        
+        # 폰트 설정
+        font_size = settings.get('fontSize', 20)
+        font_color = settings.get('fontColor', '#000000')
+        
+        try:
+            # 기본 폰트 사용
+            font = ImageFont.load_default()
+        except:
+            font = None
+        
+        # 각 음표 아래에 계이름 표시
+        for note in notes:
+            text = note['note_name']
+            x = note['center_x']
+            y = note['y'] + note['height'] + 5
+            
+            if font:
+                # 텍스트 크기 계산
+                bbox = draw.textbbox((0, 0), text, font=font)
+                text_width = bbox[2] - bbox[0]
+                text_x = x - text_width // 2
+                
+                # 텍스트 그리기
+                draw.text((text_x, y), text, fill=font_color, font=font)
+            else:
+                # 폰트가 없으면 간단한 점으로 표시
+                draw.ellipse([x-2, y-2, x+2, y+2], fill=font_color)
+        
+        # PIL을 다시 OpenCV로 변환
+        result_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        return result_image
+    except:
+        return original_image
 
 if __name__ == '__main__':
     print("🎵 악보 인식 서버 시작...")
     print("📍 서버 주소: http://localhost:5000")
     print("🔍 상태 확인: http://localhost:5000/health")
     print("📝 API 엔드포인트: POST /analyze-sheet-music")
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)  # debug=False로 메모리 절약
